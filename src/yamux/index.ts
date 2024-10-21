@@ -237,7 +237,7 @@ export class YamuxMultiplexer {
     }
 
     if (hasFlag(message.flags, MessageFlag.FIN)) {
-      stream.readableController?.close();
+      stream.markReadClosed();
     }
   }
 
@@ -319,44 +319,59 @@ class YamuxStream implements DuplexStream<Uint8Array> {
   public writable: WritableStream<Uint8Array>;
   public windowSize = 256 * 1024;
   public buffer: Uint8Array[] = [];
-  public readableController?: ReadableStreamController<Uint8Array>;
+
+  public isReadClosed = false;
+  public isWriteClosed = false;
+
+  public get isClosed() {
+    return this.isReadClosed && this.isWriteClosed;
+  }
 
   /**
    * Promise resolver that notifies the async iterator that
    * a new value has arrived.
    */
-  private notifyNewChunk?: () => void;
+  private notifyReader?: () => void;
 
   public addChunk(chunk: Uint8Array) {
     this.buffer.push(chunk);
-    this.notifyNewChunk?.();
+    this.notifyReader?.();
+  }
+
+  public markReadClosed() {
+    this.isReadClosed = true;
+    this.notifyReader?.();
   }
 
   constructor(private options: LogicalStreamOptions) {
     this.id = options.id;
 
     this.readable = new ReadableStream<Uint8Array>({
-      start: (controller) => {
-        this.readableController = controller;
-      },
       pull: async (controller) => {
         while (this.buffer.length === 0) {
+          // Close controller once marked as closed and buffer is empty
+          if (this.isReadClosed) {
+            controller.close();
+            return;
+          }
           await new Promise<void>((resolve) => {
-            this.notifyNewChunk = resolve;
+            this.notifyReader = resolve;
           });
         }
 
         // biome-ignore lint/style/noNonNullAssertion: verified via while loop
         const chunk = this.buffer.shift()!;
 
-        // Increase peer's window size every time a chunk is read
-        await this.options.writeMessage({
-          version: 0,
-          type: MessageType.WindowUpdate,
-          flags: 0,
-          streamId: this.id,
-          windowSize: chunk.byteLength,
-        });
+        if (!this.isReadClosed) {
+          // Increase peer's window every time a chunk is read
+          await this.options.writeMessage({
+            version: 0,
+            type: MessageType.WindowUpdate,
+            flags: 0,
+            streamId: this.id,
+            windowSize: chunk.byteLength,
+          });
+        }
 
         controller.enqueue(chunk);
       },
@@ -391,6 +406,7 @@ class YamuxStream implements DuplexStream<Uint8Array> {
           length: 0,
           data: new Uint8Array(),
         });
+        this.isWriteClosed = true;
       },
     });
   }

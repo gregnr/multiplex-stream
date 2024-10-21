@@ -9,7 +9,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 describe('multiplexStream', () => {
-  test('basic', async () => {
+  test('single stream single direction', async () => {
     const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
 
     const clientMuxer = await multiplexStream(clientTransport, {
@@ -56,5 +56,58 @@ describe('multiplexStream', () => {
     for await (const message of fromReadable(framedStream.readable)) {
       expect(decoder.decode(message)).toBe('world!');
     }
+  });
+
+  test('multiple streams single direction', async () => {
+    const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
+
+    const clientMuxer = await multiplexStream(clientTransport, {
+      transportDirection: 'outbound',
+    });
+    const serverMuxer = await multiplexStream(serverTransport, {
+      transportDirection: 'inbound',
+    });
+
+    async function handleStreams(
+      streams: AsyncIterable<DuplexStream<Uint8Array>>
+    ) {
+      async function handleMessages(stream: DuplexStream<Uint8Array>) {
+        const writer = stream.writable.getWriter();
+
+        for await (const chunk of fromReadable(stream.readable)) {
+          const testId = decoder.decode(chunk);
+          await writer.write(encoder.encode(`Hello ${testId}`));
+          await writer.close();
+        }
+      }
+
+      for await (const stream of streams) {
+        const framedStream = frameStream(stream);
+
+        // Process incoming messages without blocking
+        handleMessages(framedStream);
+      }
+    }
+
+    const streams = serverMuxer.listen();
+
+    // Process incoming streams without blocking
+    handleStreams(streams);
+
+    async function testConnection(testId: string) {
+      // Send and receive messages from client-to-server
+      const stream = await clientMuxer.connect();
+      const framedStream = frameStream(stream);
+      const writer = framedStream.writable.getWriter();
+
+      await writer.write(encoder.encode(testId));
+      await writer.close();
+
+      for await (const message of fromReadable(framedStream.readable)) {
+        expect(decoder.decode(message)).toBe(`Hello ${testId}`);
+      }
+    }
+
+    await Promise.all([testConnection('A'), testConnection('B')]);
   });
 });
