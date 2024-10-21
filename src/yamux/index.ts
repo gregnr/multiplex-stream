@@ -257,8 +257,13 @@ export class YamuxMultiplexer {
    * @returns A `ReadableStream` of logical duplex streams (stream of streams).
    * Can be iterated over using the `for await ... of` syntax.
    */
-  listen(): AsyncIterable<DuplexStream<Uint8Array>> {
-    return this.streams;
+  async *listen(): AsyncIterable<DuplexStream<Uint8Array>> {
+    for await (const stream of this.streams) {
+      // Only yield incoming logical streams
+      if (stream.transportDirection !== this.options.transportDirection) {
+        yield stream;
+      }
+    }
   }
 
   /**
@@ -325,6 +330,10 @@ class YamuxStream implements DuplexStream<Uint8Array> {
 
   public get isClosed() {
     return this.isReadClosed && this.isWriteClosed;
+  }
+
+  public get transportDirection() {
+    return this.id % 2 === 1 ? 'outbound' : 'inbound';
   }
 
   /**
