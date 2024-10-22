@@ -221,12 +221,12 @@ export class YamuxMultiplexer {
     switch (message.type) {
       case MessageType.Data: {
         if (message.data.byteLength > 0) {
-          stream.addChunk(message.data);
+          getInternals(stream).addChunk(message.data);
         }
         break;
       }
       case MessageType.WindowUpdate: {
-        stream.windowSize += message.windowSize;
+        getInternals(stream).increaseWindow(message.windowSize);
         break;
       }
       default: {
@@ -237,7 +237,7 @@ export class YamuxMultiplexer {
     }
 
     if (hasFlag(message.flags, MessageFlag.FIN)) {
-      stream.markReadClosed();
+      getInternals(stream).closeRead();
     }
   }
 
@@ -318,18 +318,45 @@ type LogicalStreamOptions = {
   writeMessage(message: Message): Promise<void>;
 };
 
+type YamuxStreamInternals = {
+  /**
+   * Adds a chunk to the stream's internal read buffer.
+   */
+  addChunk(chunk: Uint8Array): void;
+
+  /**
+   * Marks the stream as closed. The stream will continue
+   * to yield chunks from its internal read buffer until empty,
+   * then will close its readable stream.
+   */
+  closeRead(): void;
+
+  /**
+   * Increases the stream's window size by the specified amount.
+   */
+  increaseWindow(size: number): void;
+};
+
 class YamuxStream implements DuplexStream<Uint8Array> {
   public id: number;
   public readable: ReadableStream<Uint8Array>;
   public writable: WritableStream<Uint8Array>;
-  public windowSize = 256 * 1024;
-  public buffer: Uint8Array[] = [];
 
-  public isReadClosed = false;
-  public isWriteClosed = false;
+  #windowSize = 256 * 1024;
+  #readBuffer: Uint8Array[] = [];
+  #isReadClosed = false;
+  #isWriteClosed = false;
+
+  public get isReadClosed() {
+    return this.#isReadClosed;
+  }
+
+  public get isWriteClosed() {
+    return this.#isWriteClosed;
+  }
 
   public get isClosed() {
-    return this.isReadClosed && this.isWriteClosed;
+    return this.#isReadClosed && this.#isWriteClosed;
   }
 
   public get transportDirection() {
@@ -340,38 +367,49 @@ class YamuxStream implements DuplexStream<Uint8Array> {
    * Promise resolver that notifies the async iterator that
    * a new value has arrived.
    */
-  private notifyReader?: () => void;
+  #notifyReader?: () => void;
 
-  public addChunk(chunk: Uint8Array) {
-    this.buffer.push(chunk);
-    this.notifyReader?.();
-  }
-
-  public markReadClosed() {
-    this.isReadClosed = true;
-    this.notifyReader?.();
-  }
+  /**
+   * Promise resolver that notifies the writer that the
+   * window size has changed.
+   */
+  #notifyWriter?: () => void;
 
   constructor(private options: LogicalStreamOptions) {
     this.id = options.id;
 
+    yamuxStreamInternals.set(this, {
+      addChunk: (chunk: Uint8Array) => {
+        this.#readBuffer.push(chunk);
+        this.#notifyReader?.();
+      },
+      closeRead: () => {
+        this.#isReadClosed = true;
+        this.#notifyReader?.();
+      },
+      increaseWindow: (size: number) => {
+        this.#windowSize += size;
+        this.#notifyWriter?.();
+      },
+    });
+
     this.readable = new ReadableStream<Uint8Array>({
       pull: async (controller) => {
-        while (this.buffer.length === 0) {
+        while (this.#readBuffer.length === 0) {
           // Close controller once marked as closed and buffer is empty
-          if (this.isReadClosed) {
+          if (this.#isReadClosed) {
             controller.close();
             return;
           }
           await new Promise<void>((resolve) => {
-            this.notifyReader = resolve;
+            this.#notifyReader = resolve;
           });
         }
 
         // biome-ignore lint/style/noNonNullAssertion: verified via while loop
-        const chunk = this.buffer.shift()!;
+        const chunk = this.#readBuffer.shift()!;
 
-        if (!this.isReadClosed) {
+        if (!this.#isReadClosed) {
           // Increase peer's window every time a chunk is read
           await this.options.writeMessage({
             version: 0,
@@ -390,12 +428,13 @@ class YamuxStream implements DuplexStream<Uint8Array> {
       write: async (chunk) => {
         const length = chunk.byteLength;
 
-        while (length > this.windowSize) {
-          // Yield to the event loop
-          await new Promise<void>((resolve) => setTimeout(resolve));
+        while (length > this.#windowSize) {
+          await new Promise<void>((resolve) => {
+            this.#notifyWriter = resolve;
+          });
         }
 
-        this.windowSize -= length;
+        this.#windowSize -= length;
 
         await options.writeMessage({
           version: 0,
@@ -415,10 +454,28 @@ class YamuxStream implements DuplexStream<Uint8Array> {
           length: 0,
           data: new Uint8Array(),
         });
-        this.isWriteClosed = true;
+        this.#isWriteClosed = true;
       },
     });
   }
+}
+
+const yamuxStreamInternals = new WeakMap<YamuxStream, YamuxStreamInternals>();
+
+/**
+ * Provides access to internal `YamuxStream` methods from outside its class.
+ *
+ * These internal methods need to be available to `YamuxMultiplexer`, but
+ * shouldn't be accessible outside of this module.
+ */
+function getInternals(stream: YamuxStream) {
+  const internals = yamuxStreamInternals.get(stream);
+
+  if (!internals) {
+    throw new Error(`internals do not exist for stream ${stream.id}`);
+  }
+
+  return internals;
 }
 
 /**
