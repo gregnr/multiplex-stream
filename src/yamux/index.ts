@@ -1,80 +1,12 @@
 import type { DuplexStream } from '../types.js';
 import { AsyncIterableMap } from '../util/async-iterable-map.js';
 import { fromReader } from '../util/async-iterator.js';
-import { collectFrames, concat } from '../util/frames.js';
+import { concat } from '../util/frames.js';
+import { type Message, MessageFlag, MessageType } from './types.js';
+import { hasFlag, parseMessages, serializeHeader } from './util.js';
 
-export type BaseHeader = {
-  version: number;
-  flags: number;
-  streamId: number;
-};
-
-export type DataHeader = BaseHeader & {
-  type: MessageType['Data'];
-  length: number;
-};
-
-export type WindowUpdateHeader = BaseHeader & {
-  type: MessageType['WindowUpdate'];
-  windowSize: number;
-};
-
-export type PingHeader = BaseHeader & {
-  type: MessageType['Ping'];
-  value: number;
-};
-
-export type GoAwayHeader = BaseHeader & {
-  type: MessageType['GoAway'];
-  errorCode: MessageErrorCode[keyof MessageErrorCode];
-};
-
-export type Header =
-  | DataHeader
-  | WindowUpdateHeader
-  | PingHeader
-  | GoAwayHeader;
-
-export type DataMessage = DataHeader & { data: Uint8Array };
-
-export type WindowUpdateMessage = WindowUpdateHeader;
-
-export type PingMessage = PingHeader;
-
-export type GoAwayMessage = GoAwayHeader;
-
-export type Message =
-  | DataMessage
-  | WindowUpdateMessage
-  | PingMessage
-  | GoAwayMessage;
-
-// Preferring `const` over `enum` for type trimming purposes
-export const MessageType = {
-  Data: 0x0,
-  WindowUpdate: 0x1,
-  Ping: 0x2,
-  GoAway: 0x3,
-} as const;
-
-// Preferring `const` over `enum` for type trimming purposes
-export const MessageFlag = {
-  SYN: 0x1,
-  ACK: 0x2,
-  FIN: 0x4,
-  RST: 0x8,
-} as const;
-
-// Preferring `const` over `enum` for type trimming purposes
-export const MessageErrorCode = {
-  NormalTermination: 0x0,
-  ProtocolError: 0x1,
-  InternalError: 0x2,
-} as const;
-
-export type MessageType = typeof MessageType;
-export type MessageFlag = typeof MessageFlag;
-export type MessageErrorCode = typeof MessageErrorCode;
+export * from './types.js';
+export * from './util.js';
 
 export const headerLength = 12;
 export const defaultWindowSize = 256 * 1024;
@@ -112,11 +44,13 @@ export type YamuxMultiplexerOptions = {
 };
 
 export class YamuxMultiplexer {
-  private streams = new AsyncIterableMap<number, YamuxStream>();
-  private nextStreamId: number;
-  private transportReader: ReadableStreamDefaultReader<Uint8Array>;
-  private transportWriter: WritableStreamDefaultWriter<Uint8Array>;
-  private pendingStreams = new Map<
+  #options: YamuxMultiplexerOptions;
+  #transport: DuplexStream<Uint8Array>;
+  #transportReader: ReadableStreamDefaultReader<Uint8Array>;
+  #transportWriter: WritableStreamDefaultWriter<Uint8Array>;
+  #nextStreamId: number;
+  #streams = new AsyncIterableMap<number, YamuxStream>();
+  #pendingStreams = new Map<
     number,
     {
       resolve: (stream: YamuxStream) => void;
@@ -126,8 +60,8 @@ export class YamuxMultiplexer {
   >();
 
   constructor(
-    private transport: DuplexStream<Uint8Array>,
-    private options: YamuxMultiplexerOptions
+    transport: DuplexStream<Uint8Array>,
+    options: YamuxMultiplexerOptions
   ) {
     if (
       options.defaultMaxBufferSize &&
@@ -136,39 +70,39 @@ export class YamuxMultiplexer {
       throw new Error('defaultMaxBufferSize must be a minimum of 256KB');
     }
 
-    this.transportReader = this.transport.readable.getReader();
-    this.transportWriter = this.transport.writable.getWriter();
+    this.#options = options;
+    this.#transport = transport;
+    this.#transportReader = this.#transport.readable.getReader();
+    this.#transportWriter = this.#transport.writable.getWriter();
+    this.#nextStreamId = options.transportDirection === 'outbound' ? 1 : 2;
 
-    this.nextStreamId = options.transportDirection === 'outbound' ? 1 : 2;
-
-    this.init();
+    this.#init();
   }
 
-  private async init() {
-    const messages = parseMessages(fromReader(this.transportReader));
+  async #init() {
+    const messages = parseMessages(fromReader(this.#transportReader));
 
     for await (const message of messages) {
-      await new Promise((resolve) => setTimeout(resolve));
-      await this.readMessage(message);
+      await this.#readMessage(message);
     }
   }
 
-  private debug<D>(message: string, data: D) {
-    if (this.options.debug) {
-      if (typeof this.options.debug === 'string') {
-        console.debug(`[${this.options.debug}] ${message}`, data);
+  #debug<D>(message: string, data: D) {
+    if (this.#options.debug) {
+      if (typeof this.#options.debug === 'string') {
+        console.debug(`[${this.#options.debug}] ${message}`, data);
       } else {
         console.debug(message, data);
       }
     }
   }
 
-  private async readMessage(message: Message) {
+  async #readMessage(message: Message) {
     if (message.version !== 0) {
       throw new Error(`expected yamux version 0, received ${message.version}`);
     }
 
-    this.debug('inbound message', message);
+    this.#debug('inbound message', message);
 
     if (message.streamId === 0) {
       switch (message.type) {
@@ -196,9 +130,9 @@ export class YamuxMultiplexer {
       // TODO: support max # streams and reject via RST
 
       const maxBufferSize =
-        this.options.defaultMaxBufferSize ?? defaultWindowSize;
+        this.#options.defaultMaxBufferSize ?? defaultWindowSize;
 
-      await this.writeMessage({
+      await this.#writeMessage({
         version: 0,
         type: MessageType.WindowUpdate,
         flags: MessageFlag.ACK,
@@ -206,22 +140,22 @@ export class YamuxMultiplexer {
         windowSize: maxBufferSize - defaultWindowSize,
       });
 
-      stream = this.createLogicalStream(message.streamId, {
+      stream = this.#createLogicalStream(message.streamId, {
         maxBufferSize,
       });
     }
     // ACK from peer, create new stream
     else if (hasFlag(message.flags, MessageFlag.ACK)) {
-      const pendingStream = this.pendingStreams.get(message.streamId);
+      const pendingStream = this.#pendingStreams.get(message.streamId);
 
       if (!pendingStream) {
         console.warn(`received ACK before SYN for stream ${message.streamId}`);
         return;
       }
 
-      this.pendingStreams.delete(message.streamId);
+      this.#pendingStreams.delete(message.streamId);
 
-      stream = this.createLogicalStream(
+      stream = this.#createLogicalStream(
         message.streamId,
         pendingStream.options
       );
@@ -229,19 +163,19 @@ export class YamuxMultiplexer {
     }
     // RST from peer, reject new stream
     else if (hasFlag(message.flags, MessageFlag.RST)) {
-      const pendingStream = this.pendingStreams.get(message.streamId);
+      const pendingStream = this.#pendingStreams.get(message.streamId);
 
       if (!pendingStream) {
         console.warn(`received RST before SYN for stream ${message.streamId}`);
         return;
       }
 
-      this.pendingStreams.delete(message.streamId);
+      this.#pendingStreams.delete(message.streamId);
 
       pendingStream.reject(new Error('connection rejected by peer'));
       return;
     } else {
-      stream = this.streams.get(message.streamId);
+      stream = this.#streams.get(message.streamId);
     }
 
     if (!stream) {
@@ -272,14 +206,33 @@ export class YamuxMultiplexer {
     }
   }
 
-  private async writeMessage(message: Message) {
-    this.debug('outbound message', message);
+  async #writeMessage(message: Message) {
+    this.#debug('outbound message', message);
 
     const header = serializeHeader(message);
     const frame =
       message.type === MessageType.Data ? concat(header, message.data) : header;
 
-    await this.transportWriter.write(frame);
+    await this.#transportWriter.write(frame);
+  }
+
+  #getNextStreamId() {
+    const nextStreamId = this.#nextStreamId;
+
+    // ID is always odd or always even depending on transport direction
+    this.#nextStreamId += 2;
+
+    return nextStreamId;
+  }
+
+  #createLogicalStream(id: number, options: YamuxStreamOptions) {
+    const stream = new YamuxStream(id, options, {
+      writeMessage: async (message) => await this.#writeMessage(message),
+    });
+
+    this.#streams.set(id, stream);
+
+    return stream;
   }
 
   /**
@@ -288,10 +241,10 @@ export class YamuxMultiplexer {
    * @returns An `AsyncIterator` of logical duplex streams.
    * Can be iterated over using the `for await ... of` syntax.
    */
-  async *listen(): AsyncIterable<DuplexStream<Uint8Array>> {
-    for await (const stream of this.streams) {
+  async *listen(): AsyncIterableIterator<DuplexStream<Uint8Array>> {
+    for await (const stream of this.#streams) {
       // Only yield incoming logical streams
-      if (stream.transportDirection !== this.options.transportDirection) {
+      if (stream.transportDirection !== this.#options.transportDirection) {
         yield stream;
       }
     }
@@ -302,30 +255,20 @@ export class YamuxMultiplexer {
    *
    * @returns The logical duplex stream created.
    */
-  async connect(
-    options: YamuxStreamOptions = {}
-  ): Promise<DuplexStream<Uint8Array>> {
+  async connect(options: YamuxStreamOptions = {}) {
     if (options.maxBufferSize && options.maxBufferSize < defaultWindowSize) {
       throw new Error('maxBufferSize must be a minimum of 256KB');
     }
 
-    const streamId = this.getNextStreamId();
+    const streamId = this.#getNextStreamId();
     const maxBufferSize =
       options.maxBufferSize ??
-      this.options.defaultMaxBufferSize ??
+      this.#options.defaultMaxBufferSize ??
       defaultWindowSize;
 
-    await this.writeMessage({
-      version: 0,
-      type: MessageType.WindowUpdate,
-      flags: MessageFlag.SYN,
-      streamId,
-      windowSize: maxBufferSize - defaultWindowSize,
-    });
-
     // Wait for ACK or RST from peer
-    const stream = await new Promise<YamuxStream>((resolve, reject) => {
-      this.pendingStreams.set(streamId, {
+    const streamPromise = new Promise<YamuxStream>((resolve, reject) => {
+      this.#pendingStreams.set(streamId, {
         resolve,
         reject,
         options: {
@@ -334,30 +277,21 @@ export class YamuxMultiplexer {
       });
     });
 
-    return stream;
-  }
-
-  private getNextStreamId() {
-    const nextStreamId = this.nextStreamId;
-
-    // ID is always odd or always even depending on transport direction
-    this.nextStreamId += 2;
-
-    return nextStreamId;
-  }
-
-  private createLogicalStream(id: number, options: YamuxStreamOptions) {
-    const stream = new YamuxStream(id, options, {
-      writeMessage: async (message) => await this.writeMessage(message),
+    await this.#writeMessage({
+      version: 0,
+      type: MessageType.WindowUpdate,
+      flags: MessageFlag.SYN,
+      streamId,
+      windowSize: maxBufferSize - defaultWindowSize,
     });
 
-    this.streams.set(id, stream);
+    const stream = await streamPromise;
 
     return stream;
   }
 }
 
-type YamuxStreamOptions = {
+export type YamuxStreamOptions = {
   /**
    * Max buffer size for the stream stream (in bytes). Must be
    * a minimum of 256KB. Defaults to 256KB as per the Yamux spec.
@@ -371,30 +305,11 @@ type YamuxStreamOptions = {
   maxBufferSize?: number;
 };
 
-type YamuxStreamAdapters = {
+export type YamuxStreamAdapters = {
   writeMessage(message: Message): Promise<void>;
 };
 
-type YamuxStreamInternals = {
-  /**
-   * Adds a chunk to the stream's internal read buffer.
-   */
-  addChunk(chunk: Uint8Array): void;
-
-  /**
-   * Marks the stream as closed. The stream will continue
-   * to yield chunks from its internal read buffer until empty,
-   * then will close its readable stream.
-   */
-  closeRead(): void;
-
-  /**
-   * Increases the stream's window size by the specified amount.
-   */
-  increaseWindow(size: number): void;
-};
-
-class YamuxStream implements DuplexStream<Uint8Array> {
+export class YamuxStream implements DuplexStream<Uint8Array> {
   id: number;
   readable: ReadableStream<Uint8Array>;
   writable: WritableStream<Uint8Array>;
@@ -541,6 +456,25 @@ class YamuxStream implements DuplexStream<Uint8Array> {
   }
 }
 
+type YamuxStreamInternals = {
+  /**
+   * Adds a chunk to the stream's internal read buffer.
+   */
+  addChunk(chunk: Uint8Array): void;
+
+  /**
+   * Marks the stream as closed. The stream will continue
+   * to yield chunks from its internal read buffer until empty,
+   * then will close its readable stream.
+   */
+  closeRead(): void;
+
+  /**
+   * Increases the stream's window size by the specified amount.
+   */
+  increaseWindow(size: number): void;
+};
+
 const yamuxStreamInternals = new WeakMap<YamuxStream, YamuxStreamInternals>();
 
 /**
@@ -557,167 +491,4 @@ function getInternals(stream: YamuxStream) {
   }
 
   return internals;
-}
-
-/**
- * Buffers partial byte chunks and yields parsed Yamux messages
- * as they become available.
- */
-export async function* parseMessages(
-  chunks: AsyncIterable<Uint8Array>
-): AsyncIterable<Message> {
-  const frames = collectFrames(chunks, {
-    // Yamux headers are always 12 bytes
-    headerLength,
-
-    // Yamux frame lengths depends on the contents of the header
-    frameLength(headerBytes) {
-      const header = parseHeader(headerBytes);
-
-      // Frame length is header + data for data messages, otherwise just header
-      return (
-        headerBytes.byteLength +
-        (header.type === MessageType.Data ? header.length : 0)
-      );
-    },
-  });
-
-  // Parse and yield each frame
-  for await (const frame of frames) {
-    yield parseMessage(frame);
-  }
-}
-
-export function parseMessage(message: Uint8Array): Message {
-  const header = parseHeader(message);
-
-  if (header.type === MessageType.Data) {
-    const data = message.subarray(headerLength, headerLength + header.length);
-    return { ...header, data };
-  }
-
-  return header;
-}
-
-/**
- * Parses the header from a Yamux message frame.
- */
-export function parseHeader(message: Uint8Array): Header {
-  if (message.length < headerLength) {
-    throw new Error('not enough bytes to parse header');
-  }
-
-  const dataView = new DataView(
-    message.buffer,
-    message.byteOffset,
-    message.byteLength
-  );
-
-  const version = dataView.getUint8(0);
-  const type = dataView.getUint8(1);
-  const flags = dataView.getUint16(2);
-  const streamId = dataView.getUint32(4);
-
-  switch (type) {
-    case MessageType.Data: {
-      const length = dataView.getUint32(8);
-
-      return {
-        version,
-        type,
-        flags,
-        streamId,
-        length,
-      };
-    }
-    case MessageType.WindowUpdate: {
-      const windowSize = dataView.getUint32(8);
-
-      return {
-        version,
-        type,
-        flags,
-        streamId,
-        windowSize,
-      };
-    }
-    case MessageType.Ping: {
-      const value = dataView.getUint32(8);
-
-      return {
-        version,
-        type,
-        flags,
-        streamId,
-        value,
-      };
-    }
-    case MessageType.GoAway: {
-      const errorCode = dataView.getUint32(8);
-
-      if (
-        errorCode !== MessageErrorCode.NormalTermination &&
-        errorCode !== MessageErrorCode.ProtocolError &&
-        errorCode !== MessageErrorCode.InternalError
-      ) {
-        throw new Error(`unknown error code ${errorCode}`);
-      }
-
-      return {
-        version,
-        type,
-        flags,
-        streamId,
-        errorCode,
-      };
-    }
-  }
-
-  throw new Error(`unknown message type: ${type}`);
-}
-
-export function hasFlag(flags: number, flag: number) {
-  return (flags & flag) === flag;
-}
-
-/**
- * Serializes a header into bytes.
- */
-export function serializeHeader(header: Header) {
-  const headerBytes = new Uint8Array(12);
-  const dataView = new DataView(
-    headerBytes.buffer,
-    headerBytes.byteOffset,
-    headerBytes.byteLength
-  );
-
-  dataView.setUint8(0, header.version);
-  dataView.setUint8(1, header.type);
-  dataView.setUint16(2, header.flags);
-  dataView.setUint32(4, header.streamId);
-
-  switch (header.type) {
-    case MessageType.Data: {
-      dataView.setUint32(8, header.length);
-      break;
-    }
-    case MessageType.WindowUpdate: {
-      dataView.setUint32(8, header.windowSize);
-      break;
-    }
-    case MessageType.Ping: {
-      dataView.setUint32(8, header.value);
-      break;
-    }
-    case MessageType.GoAway: {
-      dataView.setUint32(8, header.errorCode);
-      break;
-    }
-    default: {
-      const { type } = header;
-      throw new Error(`unknown header type '${type}'`);
-    }
-  }
-
-  return headerBytes;
 }

@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'vitest';
-import { multiplexStream, type YamuxMultiplexer } from '.';
-import { frameStream } from './frame/length-prefixed-frames';
-import type { DuplexStream } from './types';
-import { fromReadable } from './util/async-iterator';
-import { createDuplexPair } from './util/streams';
+import { collectStream, getFirstStream } from '../test/util.js';
+import { frameStream } from './frame/length-prefixed-frames.js';
+import { multiplexStream, type YamuxMultiplexer } from './index.js';
+import type { DuplexStream } from './types.js';
+import { fromReadable } from './util/async-iterator.js';
+import { createDuplexPair } from './util/streams.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -315,22 +316,3 @@ describe('flow control', () => {
     ).rejects.toThrowError('maxBufferSize must be a minimum of 256KB');
   });
 });
-
-async function getFirstStream(
-  streams: AsyncIterable<DuplexStream<Uint8Array>>
-) {
-  for await (const stream of streams) {
-    return stream;
-  }
-  throw new Error('transport closed before stream arrived');
-}
-
-async function collectStream<T>(stream: ReadableStream<T>) {
-  const chunks: T[] = [];
-
-  for await (const chunk of fromReadable(stream)) {
-    chunks.push(chunk);
-  }
-
-  return chunks;
-}
