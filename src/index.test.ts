@@ -8,7 +8,7 @@ import { createDuplexPair } from './util/streams';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-describe('multiplexStream', () => {
+describe('multiplex', () => {
   test('single stream single direction', async () => {
     const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
 
@@ -171,3 +171,166 @@ describe('multiplexStream', () => {
     ]);
   });
 });
+
+describe('flow control', () => {
+  test('chunk less than window size sends single segment', async () => {
+    const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
+
+    const clientMuxer = await multiplexStream(clientTransport, {
+      transportDirection: 'outbound',
+    });
+    const serverMuxer = await multiplexStream(serverTransport, {
+      transportDirection: 'inbound',
+    });
+
+    const [clientStream, serverStream] = await Promise.all([
+      clientMuxer.connect(),
+      getFirstStream(serverMuxer.listen()),
+    ]);
+    const clientWriter = clientStream.writable.getWriter();
+
+    const [chunks] = await Promise.all([
+      collectStream(serverStream.readable),
+      clientWriter
+        .write(new Uint8Array(256 * 1024))
+        .then(() => clientWriter.close()),
+    ]);
+
+    expect(chunks.length).toBe(1);
+    expect(chunks[0]?.byteLength).toBe(256 * 1024);
+  });
+
+  test('chunk greater than window size sends multiple segments', async () => {
+    const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
+
+    const clientMuxer = await multiplexStream(clientTransport, {
+      transportDirection: 'outbound',
+    });
+    const serverMuxer = await multiplexStream(serverTransport, {
+      transportDirection: 'inbound',
+    });
+
+    const [clientStream, serverStream] = await Promise.all([
+      clientMuxer.connect(),
+      getFirstStream(serverMuxer.listen()),
+    ]);
+    const clientWriter = clientStream.writable.getWriter();
+
+    const [chunks] = await Promise.all([
+      collectStream(serverStream.readable),
+      clientWriter
+        .write(new Uint8Array(256 * 1024 + 1))
+        .then(() => clientWriter.close()),
+    ]);
+
+    expect(chunks.length).toBe(2);
+    expect(chunks[0]?.byteLength).toBe(256 * 1024);
+    expect(chunks[1]?.byteLength).toBe(1);
+  });
+
+  test('custom buffer size on inbound streams', async () => {
+    const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
+
+    const clientMuxer = await multiplexStream(clientTransport, {
+      transportDirection: 'outbound',
+    });
+    const serverMuxer = await multiplexStream(serverTransport, {
+      transportDirection: 'inbound',
+      defaultMaxBufferSize: 512 * 1024,
+    });
+
+    const [clientStream, serverStream] = await Promise.all([
+      clientMuxer.connect(),
+      getFirstStream(serverMuxer.listen()),
+    ]);
+    const clientWriter = clientStream.writable.getWriter();
+
+    const [chunks] = await Promise.all([
+      collectStream(serverStream.readable),
+      clientWriter
+        .write(new Uint8Array(512 * 1024 + 1))
+        .then(() => clientWriter.close()),
+    ]);
+
+    expect(chunks.length).toBe(2);
+    expect(chunks[0]?.byteLength).toBe(512 * 1024);
+    expect(chunks[1]?.byteLength).toBe(1);
+  });
+
+  test('custom buffer size less than 256KB on inbound streams fails', async () => {
+    const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
+
+    await multiplexStream(clientTransport, {
+      transportDirection: 'outbound',
+    });
+
+    await expect(
+      multiplexStream(serverTransport, {
+        transportDirection: 'inbound',
+        defaultMaxBufferSize: 32,
+      })
+    ).rejects.toThrowError('defaultMaxBufferSize must be a minimum of 256KB');
+  });
+
+  test('custom buffer size on outbound streams', async () => {
+    const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
+
+    const clientMuxer = await multiplexStream(clientTransport, {
+      transportDirection: 'outbound',
+    });
+    const serverMuxer = await multiplexStream(serverTransport, {
+      transportDirection: 'inbound',
+    });
+
+    const [clientStream, serverStream] = await Promise.all([
+      clientMuxer.connect({ maxBufferSize: 512 * 1024 }),
+      getFirstStream(serverMuxer.listen()),
+    ]);
+    const serverWriter = serverStream.writable.getWriter();
+
+    const [chunks] = await Promise.all([
+      collectStream(clientStream.readable),
+      serverWriter
+        .write(new Uint8Array(512 * 1024 + 1))
+        .then(() => serverWriter.close()),
+    ]);
+
+    expect(chunks.length).toBe(2);
+    expect(chunks[0]?.byteLength).toBe(512 * 1024);
+    expect(chunks[1]?.byteLength).toBe(1);
+  });
+
+  test('custom buffer size less than 256KB on outbound streams fails', async () => {
+    const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
+
+    const clientMuxer = await multiplexStream(clientTransport, {
+      transportDirection: 'outbound',
+    });
+    await multiplexStream(serverTransport, {
+      transportDirection: 'inbound',
+    });
+
+    await expect(
+      clientMuxer.connect({ maxBufferSize: 32 })
+    ).rejects.toThrowError('maxBufferSize must be a minimum of 256KB');
+  });
+});
+
+async function getFirstStream(
+  streams: AsyncIterable<DuplexStream<Uint8Array>>
+) {
+  for await (const stream of streams) {
+    return stream;
+  }
+  throw new Error('transport closed before stream arrived');
+}
+
+async function collectStream<T>(stream: ReadableStream<T>) {
+  const chunks: T[] = [];
+
+  for await (const chunk of fromReadable(stream)) {
+    chunks.push(chunk);
+  }
+
+  return chunks;
+}
