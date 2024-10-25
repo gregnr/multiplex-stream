@@ -102,7 +102,7 @@ export function frameMessage(
   options: FrameStreamOptions = {}
 ) {
   const { headerLength = 4 } = options;
-  const maxMessageLength = (1 << 8) * headerLength;
+  const maxMessageLength = 2 ** (8 * headerLength);
 
   if (message.byteLength > maxMessageLength) {
     throw new Error(`message exceeds max length of ${maxMessageLength} bytes`);
