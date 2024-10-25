@@ -139,25 +139,36 @@ export function serializeHeader(header: Header) {
     headerBytes.byteLength
   );
 
+  assertUintBitSize(header.version, 8, 'header version');
   dataView.setUint8(0, header.version);
+
+  assertUintBitSize(header.type, 8, 'header type');
   dataView.setUint8(1, header.type);
+
+  assertUintBitSize(header.flags, 16, 'header flags');
   dataView.setUint16(2, header.flags);
+
+  assertUintBitSize(header.streamId, 32, 'header stream id');
   dataView.setUint32(4, header.streamId);
 
   switch (header.type) {
     case MessageType.Data: {
+      assertUintBitSize(header.length, 32, 'header length');
       dataView.setUint32(8, header.length);
       break;
     }
     case MessageType.WindowUpdate: {
+      assertUintBitSize(header.windowSize, 32, 'header window size');
       dataView.setUint32(8, header.windowSize);
       break;
     }
     case MessageType.Ping: {
+      assertUintBitSize(header.value, 32, 'header ping value');
       dataView.setUint32(8, header.value);
       break;
     }
     case MessageType.GoAway: {
+      assertUintBitSize(header.errorCode, 32, 'header error code');
       dataView.setUint32(8, header.errorCode);
       break;
     }
@@ -168,4 +179,29 @@ export function serializeHeader(header: Header) {
   }
 
   return headerBytes;
+}
+
+/**
+ * Asserts value is within the specified unsigned integer bit size range.
+ *
+ * @returns `true` if the value is within the specified range.
+ * @throws an error if the value is not a non-negative integer or exceeds the specified bit size range.
+ */
+export function assertUintBitSize(
+  value: number,
+  bitSize: 8 | 16 | 32,
+  fieldName = 'value'
+): true {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${fieldName} must be a non-negative integer`);
+  }
+
+  console.log(value);
+
+  if (value >= 2 ** bitSize) {
+    throw new Error(
+      `${fieldName} exceeds ${bitSize}-bit unsigned integer range`
+    );
+  }
+  return true;
 }
