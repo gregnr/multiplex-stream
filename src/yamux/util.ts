@@ -1,10 +1,12 @@
-import { headerLength } from './index.js';
 import { collectFrames } from '../util/index.js';
+import { headerLength } from './index.js';
 import {
   type Header,
   type Message,
   MessageErrorCode,
+  MessageFlag,
   MessageType,
+  type PingHeader,
 } from './types.js';
 
 /**
@@ -92,6 +94,10 @@ export function parseHeader(message: Uint8Array): Header {
     case MessageType.Ping: {
       const value = dataView.getUint32(8);
 
+      if (streamId !== 0) {
+        throw new Error(`ping stream id must be 0, received ${streamId}`);
+      }
+
       return {
         version,
         type,
@@ -109,6 +115,10 @@ export function parseHeader(message: Uint8Array): Header {
         errorCode !== MessageErrorCode.InternalError
       ) {
         throw new Error(`unknown error code ${errorCode}`);
+      }
+
+      if (streamId !== 0) {
+        throw new Error(`go away stream id must be 0, received ${streamId}`);
       }
 
       return {
@@ -164,11 +174,25 @@ export function serializeHeader(header: Header) {
     }
     case MessageType.Ping: {
       assertUintBitSize(header.value, 32, 'header ping value');
+
+      const { streamId } = header;
+
+      if (streamId !== 0) {
+        throw new Error(`ping stream id must be 0, received ${streamId}`);
+      }
+
       dataView.setUint32(8, header.value);
       break;
     }
     case MessageType.GoAway: {
       assertUintBitSize(header.errorCode, 32, 'header error code');
+
+      const { streamId } = header;
+
+      if (streamId !== 0) {
+        throw new Error(`go away stream id must be 0, received ${streamId}`);
+      }
+
       dataView.setUint32(8, header.errorCode);
       break;
     }
@@ -179,6 +203,26 @@ export function serializeHeader(header: Header) {
   }
 
   return headerBytes;
+}
+
+export function createPing(value: number): PingHeader {
+  return {
+    version: 0,
+    type: MessageType.Ping,
+    flags: MessageFlag.SYN,
+    streamId: 0,
+    value: value,
+  };
+}
+
+export function createPong(value: number): PingHeader {
+  return {
+    version: 0,
+    type: MessageType.Ping,
+    flags: MessageFlag.ACK,
+    streamId: 0,
+    value: value,
+  };
 }
 
 /**
@@ -196,12 +240,50 @@ export function assertUintBitSize(
     throw new Error(`${fieldName} must be a non-negative integer`);
   }
 
-  console.log(value);
-
   if (value >= 2 ** bitSize) {
     throw new Error(
       `${fieldName} exceeds ${bitSize}-bit unsigned integer range`
     );
   }
   return true;
+}
+
+/**
+ * `Map` with auto-incrementing IDs.
+ */
+export class AutoIncrementMap<V> extends Map<number, V> {
+  #currentId = 0;
+  #capacity: number;
+
+  constructor(capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 0) {
+      throw new Error('maxId must be a positive integer');
+    }
+
+    super();
+    this.#capacity = capacity;
+  }
+
+  add(value: V): number {
+    const id = this.#getNextId();
+    this.set(id, value);
+    return id;
+  }
+
+  #getNextId() {
+    if (this.size === this.#capacity) {
+      throw new Error('auto increment map is full');
+    }
+
+    let id = this.#currentId;
+
+    // Find the next available unique ID in a circular manner
+    while (this.has(id)) {
+      id = (id + 1) % this.#capacity;
+    }
+
+    this.#currentId = (id + 1) % this.#capacity;
+
+    return id;
+  }
 }

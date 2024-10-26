@@ -16,11 +16,13 @@ export type WindowUpdateHeader = BaseHeader & {
 
 export type PingHeader = BaseHeader & {
   type: MessageType['Ping'];
+  streamId: 0;
   value: number;
 };
 
 export type GoAwayHeader = BaseHeader & {
   type: MessageType['GoAway'];
+  streamId: 0;
   errorCode: MessageErrorCode[keyof MessageErrorCode];
 };
 

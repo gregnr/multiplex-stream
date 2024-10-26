@@ -3,7 +3,14 @@ import { AsyncIterableMap } from '../util/async-iterable-map.js';
 import { fromReader } from '../util/async-iterator.js';
 import { concat } from '../util/frames.js';
 import { type Message, MessageFlag, MessageType } from './types.js';
-import { hasFlag, parseMessages, serializeHeader } from './util.js';
+import {
+  AutoIncrementMap,
+  createPing,
+  createPong,
+  hasFlag,
+  parseMessages,
+  serializeHeader,
+} from './util.js';
 
 export * from './types.js';
 export * from './util.js';
@@ -58,6 +65,11 @@ export class YamuxMultiplexer {
       options: YamuxStreamOptions;
     }
   >();
+  #pendingPings = new AutoIncrementMap<{
+    resolve: (time: number) => void;
+    reject: (err: Error) => void;
+    time: number;
+  }>(2 ** 32);
 
   constructor(
     transport: DuplexStream<Uint8Array>,
@@ -107,7 +119,20 @@ export class YamuxMultiplexer {
     if (message.streamId === 0) {
       switch (message.type) {
         case MessageType.Ping: {
-          // TODO: pong
+          if (hasFlag(message.flags, MessageFlag.SYN)) {
+            await this.#writeMessage(createPong(message.value));
+          } else if (hasFlag(message.flags, MessageFlag.ACK)) {
+            const time = Date.now();
+            const pendingPing = this.#pendingPings.get(message.value);
+            if (!pendingPing) {
+              console.warn(
+                `received pong for unknown ping id ${message.value}`
+              );
+              break;
+            }
+            this.#pendingPings.delete(message.value);
+            pendingPing.resolve(time);
+          }
           break;
         }
         case MessageType.GoAway: {
@@ -288,6 +313,23 @@ export class YamuxMultiplexer {
     const stream = await streamPromise;
 
     return stream;
+  }
+
+  /**
+   * Calculates the round trip time over the underlying transport.
+   */
+  async calculateRtt() {
+    const startTime = Date.now();
+    const endTime = await new Promise<number>((resolve, reject) => {
+      const id = this.#pendingPings.add({
+        resolve,
+        reject,
+        time: startTime,
+      });
+      this.#writeMessage(createPing(id));
+    });
+
+    return endTime - startTime;
   }
 }
 

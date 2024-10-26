@@ -5,17 +5,19 @@ import type { DuplexStream } from '../types';
  * asynchronous reads and writes.
  */
 export class BufferedStream<T> implements DuplexStream<T> {
-  public readable: ReadableStream<T>;
-  public writable: WritableStream<T>;
+  readable: ReadableStream<T>;
+  writable: WritableStream<T>;
 
   constructor() {
     const buffer: T[] = [];
+    let notifyWrite: (() => void) | undefined;
 
     this.readable = new ReadableStream<T>({
       async pull(controller) {
         while (buffer.length === 0) {
-          // Yield to the event loop
-          await new Promise<void>((resolve) => setTimeout(resolve));
+          await new Promise<void>((resolve) => {
+            notifyWrite = resolve;
+          });
         }
         // biome-ignore lint/style/noNonNullAssertion: <explanation>
         const chunk = buffer.shift()!;
@@ -26,9 +28,7 @@ export class BufferedStream<T> implements DuplexStream<T> {
     this.writable = new WritableStream<T>({
       async write(chunk) {
         buffer.push(chunk);
-
-        // Yield to the event loop
-        await new Promise<void>((resolve) => setTimeout(resolve));
+        notifyWrite?.();
       },
     });
   }

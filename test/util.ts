@@ -19,3 +19,24 @@ export async function collectStream<T>(stream: ReadableStream<T>) {
 
   return chunks;
 }
+
+/**
+ * Delays the readable side of a duplex stream by the specified
+ * amount in milliseconds.
+ */
+export function delayStream<T>(
+  duplex: DuplexStream<T>,
+  delay: number
+): DuplexStream<T> {
+  return {
+    readable: duplex.readable.pipeThrough(
+      new TransformStream({
+        async transform(chunk, controller) {
+          await new Promise((r) => setTimeout(r, delay));
+          controller.enqueue(chunk);
+        },
+      })
+    ),
+    writable: duplex.writable,
+  };
+}

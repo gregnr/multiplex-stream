@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { collectStream, getFirstStream } from '../test/util.js';
+import { collectStream, delayStream, getFirstStream } from '../test/util.js';
 import { frameStream } from './frame/length-prefixed-frames.js';
 import { multiplexStream, type YamuxMultiplexer } from './index.js';
 import type { DuplexStream } from './types.js';
@@ -314,5 +314,36 @@ describe('flow control', () => {
     await expect(
       clientMuxer.connect({ maxBufferSize: 32 })
     ).rejects.toThrowError('maxBufferSize must be a minimum of 256KB');
+  });
+});
+
+describe('ping', () => {
+  test('rtt', async () => {
+    const [clientTransport, serverTransport] = createDuplexPair<Uint8Array>();
+
+    const clientDelay = 30;
+    const serverDelay = 20;
+
+    const clientMuxer = await multiplexStream(
+      delayStream(clientTransport, clientDelay),
+      {
+        transportDirection: 'outbound',
+      }
+    );
+    const serverMuxer = await multiplexStream(
+      delayStream(serverTransport, serverDelay),
+      {
+        transportDirection: 'inbound',
+      }
+    );
+
+    const totalDelay = clientDelay + serverDelay;
+
+    const clientRtt = await clientMuxer.calculateRtt();
+    const serverRtt = await serverMuxer.calculateRtt();
+
+    // Expect RTT to be within 5ms of the artificial delay
+    expect(clientRtt - totalDelay).toBeLessThanOrEqual(5);
+    expect(serverRtt - totalDelay).toBeLessThanOrEqual(5);
   });
 });
